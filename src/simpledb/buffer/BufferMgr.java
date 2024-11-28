@@ -1,5 +1,10 @@
 package simpledb.buffer;
 
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+
 import simpledb.file.*;
 import simpledb.log.LogMgr;
 
@@ -10,8 +15,11 @@ import simpledb.log.LogMgr;
  */
 public class BufferMgr {
    private Buffer[] bufferpool;
+   public Map<BlockId, Buffer> bufferPoolMap;
+   private Map<Buffer, List<Long>> accessHistory;
    private int numAvailable;
    private static final long MAX_TIME = 10000; // 10 seconds
+   private static final int K = 3;
    
    /**
     * Creates a buffer manager having the specified number 
@@ -22,9 +30,14 @@ public class BufferMgr {
     */
    public BufferMgr(FileMgr fm, LogMgr lm, int numbuffs) {
       bufferpool = new Buffer[numbuffs];
+      bufferPoolMap = new HashMap<>();
+      accessHistory = new HashMap<>();
       numAvailable = numbuffs;
-      for (int i=0; i<numbuffs; i++)
-         bufferpool[i] = new Buffer(fm, lm);
+      for (int i = 0; i < numbuffs; i++) {
+          Buffer buff = new Buffer(fm, lm);
+          bufferpool[i] = buff;
+          accessHistory.put(buff, new LinkedList<>()); // Initialize empty history
+      }
    }
    
    /**
@@ -55,6 +68,7 @@ public class BufferMgr {
       buff.unpin();
       if (!buff.isPinned()) {
          numAvailable++;
+         recordAccess(buff);
          notifyAll();
       }
    }
@@ -97,20 +111,28 @@ public class BufferMgr {
     * @param blk a reference to a disk block
     * @return the pinned buffer
     */
+   
    private Buffer tryToPin(BlockId blk) {
-      Buffer buff = findExistingBuffer(blk);
-      if (buff == null) {
-         buff = chooseUnpinnedBuffer();
-         if (buff == null)
-            return null;
-         buff.assignToBlock(blk);
-      }
-      if (!buff.isPinned())
-         numAvailable--;
-      buff.pin();
-      return buff;
+       Buffer buff = bufferPoolMap.get(blk);
+       if (buff == null) {
+           buff = chooseUnpinnedBuffer();
+           if (buff == null) return null;
+
+           if (buff.block() != null) {
+               bufferPoolMap.remove(buff.block());
+           }
+           buff.assignToBlock(blk);
+           bufferPoolMap.put(blk, buff);
+       }
+       if (!buff.isPinned()) {
+           numAvailable--;
+       }
+       recordAccess(buff); // Record pin access time
+       buff.pin();
+       return buff;
    }
    
+   /*
    private Buffer findExistingBuffer(BlockId blk) {
       for (Buffer buff : bufferpool) {
          BlockId b = buff.block();
@@ -119,11 +141,51 @@ public class BufferMgr {
       }
       return null;
    }
+   */
    
    private Buffer chooseUnpinnedBuffer() {
-      for (Buffer buff : bufferpool)
-         if (!buff.isPinned())
-         return buff;
-      return null;
+       Buffer candidate = null;
+       long maxDistance = Long.MIN_VALUE;
+
+       for (Buffer buff : bufferpool) {
+           if (!buff.isPinned()) {
+               long distance = calculateBackwardKDistance(buff);
+               if (distance > maxDistance) {
+                   maxDistance = distance;
+                   candidate = buff;
+               } else if (distance == maxDistance && candidate != null) {
+                   // Fall back to traditional LRU if needed
+                   long candidateLastAccess = getLastAccess(candidate);
+                   long currentLastAccess = getLastAccess(buff);
+                   if (currentLastAccess < candidateLastAccess) {
+                       candidate = buff;
+                   }
+               }
+           }
+       }
+       return candidate;
+   }
+   
+   private long calculateBackwardKDistance(Buffer buff) {
+       List<Long> history = accessHistory.get(buff);
+       if (history.size() < K) {
+           return Long.MAX_VALUE; // Backward K distance is ∞ if less than K accesses
+       }
+       return System.currentTimeMillis() - history.get(history.size() - K);
+   }
+   
+   private long getLastAccess(Buffer buff) {
+       List<Long> history = accessHistory.get(buff);
+       return history.isEmpty() ? Long.MAX_VALUE : history.get(history.size() - 1);
+   }
+   
+   private void recordAccess(Buffer buff) {
+       List<Long> history = accessHistory.get(buff);
+       history.add(System.currentTimeMillis());
+       if (history.size() > K) {
+           history.remove(0); // Keep only the last K accesses
+       }
    }
 }
+
+
